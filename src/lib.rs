@@ -22,6 +22,7 @@
 //!
 pub mod roots;
 pub mod confine;
+mod gate;
 
 // Re-export the load-bearing surface at the crate root so embedders (and
 // md-preview's re-exports) get a flat API: `fs_confine::{confine_read, Roots,
@@ -32,3 +33,6 @@ pub use confine::{
     confine_save, DEFAULT_MAX_FILE_SIZE,
 };
 pub use roots::{Root, RootError, RootKind, Roots, ROOT_MARKERS, ROOT_TTL};
+
+// The root-union fan-out, single-sourced (ADR-0008 Phase 2 ruling (e)).
+pub use gate::{Confine, ConfineSnapshot};
