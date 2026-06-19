@@ -1,0 +1,22 @@
+# `fs-confine`: the web-free filesystem-confinement kernel, extracted from
+# md-preview (ADR-0008 Phase 2 — the security phase). Holds the multi-root
+# registry (`roots`) and the single hardened confinement funnel (`confine`):
+# canonicalize + `O_NOFOLLOW` + `fstat` on a held fd, dirfd-relative atomic save,
+# the sensitive-path denylist, and a `Confine` trait that builds the root union
+# and fans out ONCE. Deliberately free of any web/async dep (no warp/tokio/hyper)
+# AND of any edge to the other kernels (no doc-core/md-render): an independent
+# LEAF so research-thin-server (goal D1) can reuse the funnel to close its
+# `PathBuf::join` traversal hole without dragging in the daemon stack. Verify with
+# `cargo tree -p fs-confine -e normal` — std + libc only, no web/kernel crates.
+[package]
+name = "fs-confine"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+# `openat`/`renameat`/`unlinkat`, `O_NOFOLLOW`/`O_DIRECTORY`, and `fstat` for the
+# TOCTOU-free read and the symlink-safe dirfd-relative save. The sole non-std
+# dependency; NOT optional here (the funnel cannot exist without it), unlike in
+# md-preview where it was daemon-gated.
+libc = "0.2"
