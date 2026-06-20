@@ -29,9 +29,9 @@
 
 use std::path::Path;
 
+use crate::DEFAULT_MAX_FILE_SIZE;
 use crate::confine::{self, ConfineError, ConfinedFile, LinkResolution};
 use crate::roots::{Root, Roots};
-use crate::DEFAULT_MAX_FILE_SIZE;
 
 /// One confinement's fan-out inputs: the owned active-root union and the [`Roots`]
 /// registry the primitive consults for the sensitive-path denylist.
@@ -71,7 +71,12 @@ pub trait Confine {
     fn confine_read(&self, requested: &Path) -> Result<ConfinedFile, ConfineError> {
         let snap = self.confinement_snapshot(requested);
         let union_refs: Vec<&Root> = snap.union.iter().collect();
-        confine::confine_read(requested, &union_refs, &snap.registry, DEFAULT_MAX_FILE_SIZE)
+        confine::confine_read(
+            requested,
+            &union_refs,
+            &snap.registry,
+            DEFAULT_MAX_FILE_SIZE,
+        )
     }
 
     /// Symlink-safe atomic save through the funnel: fan out over the snapshot's

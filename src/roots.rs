@@ -138,7 +138,11 @@ impl std::fmt::Display for RootError {
         match self {
             RootError::NotAbsolute(p) => write!(f, "path is not absolute: {}", p.display()),
             RootError::SensitivePath(p) => {
-                write!(f, "refusing sensitive path as a recursive root: {}", p.display())
+                write!(
+                    f,
+                    "refusing sensitive path as a recursive root: {}",
+                    p.display()
+                )
             }
             RootError::Corrupt { line, reason } => {
                 write!(f, "corrupt roots file at line {line}: {reason}")
@@ -524,16 +528,16 @@ impl Roots {
             let kind_tok = parts.next().unwrap_or("");
             let secs_tok = parts.next();
             let path_tok = parts.next();
-            let (kind, secs_tok, path_tok) = match (RootKind::from_token(kind_tok), secs_tok, path_tok)
-            {
-                (Some(k), Some(s), Some(p)) => (k, s, p),
-                _ => {
-                    return Err(RootError::Corrupt {
-                        line: line_no,
-                        reason: "expected `<kind>\\t<unix-secs>\\t<path>`".into(),
-                    });
-                }
-            };
+            let (kind, secs_tok, path_tok) =
+                match (RootKind::from_token(kind_tok), secs_tok, path_tok) {
+                    (Some(k), Some(s), Some(p)) => (k, s, p),
+                    _ => {
+                        return Err(RootError::Corrupt {
+                            line: line_no,
+                            reason: "expected `<kind>\\t<unix-secs>\\t<path>`".into(),
+                        });
+                    }
+                };
             let secs: u64 = secs_tok.parse().map_err(|_| RootError::Corrupt {
                 line: line_no,
                 reason: format!("invalid timestamp: {secs_tok:?}"),
@@ -756,7 +760,11 @@ mod tests {
         let r = Roots::new(home());
         let exists = fs_with(&["/home/alice/.ssh/.git"]);
         let root = r.resolve("/home/alice/.ssh/keys.md", t0(), &exists);
-        assert_eq!(root.kind, RootKind::SingleFile, "sensitive root must downgrade");
+        assert_eq!(
+            root.kind,
+            RootKind::SingleFile,
+            "sensitive root must downgrade"
+        );
         assert_eq!(root.path, PathBuf::from("/home/alice/.ssh/keys.md"));
     }
 
@@ -843,7 +851,9 @@ mod tests {
         // The parent-absorb rule keeps only `/outer`; inner collapsed in. So the
         // owner of an inner path is `/outer`.
         let later = t0() + Duration::from_secs(60);
-        let owner = r.owning_root("/home/alice/outer/inner/x.md", later).unwrap();
+        let owner = r
+            .owning_root("/home/alice/outer/inner/x.md", later)
+            .unwrap();
         assert_eq!(owner.path, PathBuf::from("/home/alice/outer"));
         assert_eq!(owner.last_used, later, "access renews the sliding TTL");
     }
@@ -926,12 +936,18 @@ mod tests {
             Err(RootError::Corrupt { line: 1, .. })
         ));
         // Blank lines are skipped, valid lines parse.
-        assert_eq!(r.deserialize("\n\ndir\t100\t/home/alice/p\n").unwrap().len(), 1);
+        assert_eq!(
+            r.deserialize("\n\ndir\t100\t/home/alice/p\n")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn save_and_load_through_disk() {
-        let dir = std::env::temp_dir().join(format!("md-preview-roots-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("md-preview-roots-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut r = reg(&dir);
         r.register_root("/home/alice/proj", t0()).unwrap();
@@ -945,7 +961,8 @@ mod tests {
 
     #[test]
     fn load_missing_file_yields_empty_registry() {
-        let dir = std::env::temp_dir().join(format!("md-preview-roots-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("md-preview-roots-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let loaded = reg(&dir).load().unwrap();
         assert!(loaded.is_empty());

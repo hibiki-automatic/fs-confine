@@ -400,9 +400,7 @@ pub fn confine_save(
         // for the call); `temp_cstr`/`target_cstr` are NUL-terminated C strings
         // we own that outlive the call. `renameat` only reads through the
         // pointers. We check the rc below.
-        let rc = unsafe {
-            libc::renameat(dirfd, temp_cstr.as_ptr(), dirfd, target_cstr.as_ptr())
-        };
+        let rc = unsafe { libc::renameat(dirfd, temp_cstr.as_ptr(), dirfd, target_cstr.as_ptr()) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -485,7 +483,12 @@ mod tests {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let mut path = std::env::temp_dir();
-            path.push(format!("md-preview-confine-{}-{}-{}", tag, std::process::id(), n));
+            path.push(format!(
+                "md-preview-confine-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
             std::fs::create_dir_all(&path).expect("create temp dir");
             // Canonicalize so comparisons against canonicalized results hold
             // even when $TMPDIR is itself a symlink (e.g. /tmp -> /private/tmp).
@@ -582,8 +585,7 @@ mod tests {
         let union = vec![&root];
         let reg = registry_home(Path::new("/nonexistent-home"));
 
-        let err =
-            confine_path(&link, &union, &reg).expect_err("symlink escaping root rejected");
+        let err = confine_path(&link, &union, &reg).expect_err("symlink escaping root rejected");
         assert!(matches!(err, ConfineError::Escapes(_)));
     }
 
@@ -875,8 +877,8 @@ mod tests {
         let union = vec![&root];
         let reg = registry_home(Path::new("/nonexistent-home"));
 
-        let err = confine_save(&target, &union, &reg, b"x")
-            .expect_err("save outside the root rejected");
+        let err =
+            confine_save(&target, &union, &reg, b"x").expect_err("save outside the root rejected");
         assert!(matches!(err, ConfineError::Escapes(_)));
     }
 

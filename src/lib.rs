@@ -20,19 +20,19 @@
 //!   `unsafe` (libc `openat`/`renameat`/`fstat`) is contained here and
 //!   documented at each call site.
 //!
-pub mod roots;
 pub mod confine;
 mod gate;
+pub mod roots;
 
 // Re-export the load-bearing surface at the crate root so embedders (and
 // md-preview's re-exports) get a flat API: `fs_confine::{confine_read, Roots,
 // Confine, …}`. The funnel free functions stay addressable as
 // `fs_confine::confine::confine_read` too (module path unchanged).
 pub use confine::{
-    ConfineError, ConfinedFile, LinkResolution, confine_link, confine_path, confine_read,
-    confine_save, DEFAULT_MAX_FILE_SIZE,
+    ConfineError, ConfinedFile, DEFAULT_MAX_FILE_SIZE, LinkResolution, confine_link, confine_path,
+    confine_read, confine_save,
 };
-pub use roots::{Root, RootError, RootKind, Roots, ROOT_MARKERS, ROOT_TTL};
+pub use roots::{ROOT_MARKERS, ROOT_TTL, Root, RootError, RootKind, Roots};
 
 // The root-union fan-out, single-sourced (ADR-0008 Phase 2 ruling (e)).
 pub use gate::{Confine, ConfineSnapshot};
