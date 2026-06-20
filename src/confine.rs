@@ -941,4 +941,296 @@ mod tests {
 
         assert_eq!(confine_link(&link, &union, &reg), LinkResolution::Outside);
     }
+
+    // --- additional adversarial cases ----------------------------------------
+
+    #[test]
+    fn confine_path_deep_nested_traversal_rejected() {
+        // A deeply-nested `../../../../..` traversal that climbs far out of the
+        // sub-root. canonicalize resolves it; the result lands outside the root.
+        let dir = TempDir::new("deep-trav");
+        let sub = dir.file("a");
+        std::fs::create_dir_all(sub.join("b/c")).unwrap();
+        let secret = dir.file("secret.md");
+        std::fs::write(&secret, "secret").unwrap();
+
+        // sub/a is the confined root; deep traversal tries to climb back out.
+        let sub_root = dir_root(&sub);
+        let union = vec![&sub_root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        // Construct path: sub/b/c/../../.. → dir (parent of sub), then secret.md.
+        // The path must not exist at the escaped location for this test to be
+        // meaningful — we just want the containment check, not a read.
+        let deep_escape = sub
+            .join("b")
+            .join("c")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("secret.md");
+        let err = confine_path(&deep_escape, &union, &reg)
+            .expect_err("deep traversal out of sub-root rejected");
+        assert!(matches!(err, ConfineError::Escapes(_)), "got {err:?}");
+        // Also verify a genuine path inside sub is still fine.
+        let inside = sub.join("b").join("doc.md");
+        std::fs::write(&inside, "hi").unwrap();
+        assert!(confine_path(&inside, &union, &reg).is_ok());
+    }
+
+    #[test]
+    fn confine_path_string_prefix_not_component_prefix() {
+        // /tmp/rootXYZ must NOT be considered inside a root at /tmp/root.
+        // `Path::starts_with` is component-wise; verify the funnel agrees.
+        let outer = TempDir::new("strpfx-outer");
+        // Create two sibling dirs that share a string prefix.
+        let root_dir = outer.file("root");
+        let tricky_dir = outer.file("rootabc");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::fs::create_dir_all(&tricky_dir).unwrap();
+        // File inside the tricky (non-root) dir.
+        let tricky_file = tricky_dir.join("doc.md");
+        std::fs::write(&tricky_file, "tricky").unwrap();
+
+        let root = dir_root(&root_dir);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        // A path whose string representation starts with the root path but is
+        // NOT a descendant (different next component) must be rejected.
+        let err = confine_path(&tricky_file, &union, &reg)
+            .expect_err("sibling with shared string prefix must be rejected");
+        assert!(matches!(err, ConfineError::Escapes(_)));
+
+        // And a real in-root file is still accepted.
+        let real_file = root_dir.join("real.md");
+        std::fs::write(&real_file, "real").unwrap();
+        assert!(confine_path(&real_file, &union, &reg).is_ok());
+    }
+
+    #[test]
+    fn confine_read_rejects_directory_target() {
+        // Passing a directory path (not a regular file) to confine_read must fail:
+        // the funnel opens it with O_NOFOLLOW and then checks is_file() on the
+        // fstat'd metadata, which is false for a directory.
+        let dir = TempDir::new("read-dir");
+        let subdir = dir.file("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        let err = confine_read(&subdir, &union, &reg, DEFAULT_MAX_FILE_SIZE)
+            .expect_err("directory target must be rejected by confine_read");
+        assert!(
+            matches!(err, ConfineError::Io(_)),
+            "expected Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_root_boundary_wrong_root_in_union() {
+        // Two completely separate roots. A file from root A is rejected when only
+        // root B is active, and vice versa. Each root must not "bleed" into the other.
+        let root_a = TempDir::new("multi-a");
+        let root_b = TempDir::new("multi-b");
+        let file_a = root_a.file("doc.md");
+        let file_b = root_b.file("doc.md");
+        std::fs::write(&file_a, "a").unwrap();
+        std::fs::write(&file_b, "b").unwrap();
+
+        let rota = dir_root(&root_a.path);
+        let rotb = dir_root(&root_b.path);
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        // Only root B in the union — file A must be rejected.
+        let union_b = vec![&rotb];
+        let err = confine_path(&file_a, &union_b, &reg)
+            .expect_err("file in root A rejected when only root B active");
+        assert!(matches!(err, ConfineError::Escapes(_)));
+
+        // Only root A in the union — file B must be rejected.
+        let union_a = vec![&rota];
+        let err = confine_path(&file_b, &union_a, &reg)
+            .expect_err("file in root B rejected when only root A active");
+        assert!(matches!(err, ConfineError::Escapes(_)));
+
+        // Both roots — both files pass.
+        let union_ab = vec![&rota, &rotb];
+        assert!(confine_path(&file_a, &union_ab, &reg).is_ok());
+        assert!(confine_path(&file_b, &union_ab, &reg).is_ok());
+    }
+
+    #[test]
+    fn confine_link_nonexistent_file_is_outside() {
+        // A path that is under the root but does not exist on disk must classify
+        // as Outside: canonicalize fails (no such file) → confine_path errors →
+        // confine_link returns Outside.
+        let dir = TempDir::new("link-noexist");
+        let nonexistent = dir.file("ghost.md");
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        assert_eq!(
+            confine_link(&nonexistent, &union, &reg),
+            LinkResolution::Outside,
+            "non-existent in-root path must be Outside"
+        );
+    }
+
+    #[test]
+    fn confine_link_sensitive_path_is_outside() {
+        // A sensitive path must classify as Outside even when it is inside
+        // a registered root — the denylist fires first, not containment.
+        let home = TempDir::new("link-sens-home");
+        let ssh = home.file(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let key = ssh.join("id_rsa");
+        std::fs::write(&key, "PRIVATE").unwrap();
+
+        // Register .ssh itself as the root (contrived, but tests denylist ordering).
+        let root = dir_root(&ssh);
+        let union = vec![&root];
+        let reg = registry_home(&home.path);
+
+        assert_eq!(
+            confine_link(&key, &union, &reg),
+            LinkResolution::Outside,
+            "sensitive path must be Outside even when inside a registered root"
+        );
+    }
+
+    #[test]
+    fn confine_path_sensitive_inside_registered_root_still_rejected() {
+        // Even if the registry has a root that covers ~/.ssh, the denylist check
+        // fires BEFORE the containment check and produces Sensitive.
+        let home = TempDir::new("sens-in-root-home");
+        let ssh = home.file(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let key = ssh.join("id_rsa");
+        std::fs::write(&key, "PRIVATE").unwrap();
+
+        // Contrived: root covers .ssh (as if the user ran `md --root ~/.ssh`).
+        let root = dir_root(&ssh);
+        let union = vec![&root];
+        let reg = registry_home(&home.path);
+
+        let err = confine_path(&key, &union, &reg)
+            .expect_err("sensitive path must be rejected even inside a registered root");
+        assert!(
+            matches!(err, ConfineError::Sensitive(_)),
+            "expected Sensitive, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn confine_save_rejects_sensitive_target() {
+        // confine_save checks both the parent dir and the resolved target against
+        // the denylist. A save to ~/.ssh/malware must be rejected as Sensitive.
+        let home = TempDir::new("save-sens-home");
+        let ssh = home.file(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+
+        // Root covers .ssh (contrived — denylist is still consulted first).
+        let root = dir_root(&ssh);
+        let union = vec![&root];
+        let reg = registry_home(&home.path);
+
+        let target = ssh.join("malware.md");
+        let err = confine_save(&target, &union, &reg, b"evil")
+            .expect_err("save to sensitive dir rejected");
+        // The parent (.ssh) canonicalizes and hits the denylist: Sensitive.
+        assert!(
+            matches!(err, ConfineError::Sensitive(_)),
+            "expected Sensitive, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn confine_path_symlink_chain_through_two_hops_to_outside() {
+        // a.md → b.md → outside/secret.md (chain of two symlinks, final target
+        // is outside the root). canonicalize resolves the full chain; the result
+        // lands outside → Escapes.
+        let dir = TempDir::new("chain-root");
+        let outside = TempDir::new("chain-out");
+        let secret = outside.file("secret.md");
+        std::fs::write(&secret, "secret").unwrap();
+
+        // b.md points to outside/secret.md
+        let b = dir.file("b.md");
+        std::os::unix::fs::symlink(&secret, &b).unwrap();
+        // a.md points to b.md (in-root → in-root, but b.md itself points out)
+        let a = dir.file("a.md");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        let err = confine_path(&a, &union, &reg)
+            .expect_err("two-hop symlink chain escaping root rejected");
+        assert!(
+            matches!(err, ConfineError::Escapes(_)),
+            "expected Escapes, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn confine_path_symlink_dir_inside_root_pointing_outside() {
+        // A symlink to a DIRECTORY (not a file) outside the root. Accessing a
+        // file through that dir-symlink must be rejected: canonicalize follows
+        // the dir symlink and the final canonical path is outside the root.
+        let dir = TempDir::new("dirlink-root");
+        let outside = TempDir::new("dirlink-out");
+        let secret_dir = outside.file("secrets");
+        std::fs::create_dir(&secret_dir).unwrap();
+        let secret_file = secret_dir.join("key.md");
+        std::fs::write(&secret_file, "KEY").unwrap();
+
+        // dir/linked → outside/secrets (dir symlink)
+        let linked = dir.file("linked");
+        std::os::unix::fs::symlink(&secret_dir, &linked).unwrap();
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        // Accessing a file "inside" the linked dir traverses outside the root.
+        let via_link = linked.join("key.md");
+        let err = confine_path(&via_link, &union, &reg)
+            .expect_err("access via dir-symlink pointing outside must be rejected");
+        assert!(
+            matches!(err, ConfineError::Escapes(_)),
+            "expected Escapes, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn confine_path_home_itself_is_sensitive() {
+        // $HOME itself as a path target must be rejected as Sensitive even when a
+        // root covers it (e.g. root = home) — the denylist fires before containment.
+        let home = TempDir::new("home-sens");
+        // Create a real file directly in home to make canonicalize succeed.
+        let home_file = home.file("note.md");
+        std::fs::write(&home_file, "note").unwrap();
+
+        // Register home itself as a directory root (contrived edge case).
+        let root = dir_root(&home.path);
+        let union = vec![&root];
+        let reg = registry_home(&home.path);
+
+        // The home dir itself is sensitive.
+        let err = confine_path(&home.path, &union, &reg)
+            .expect_err("home dir itself must be rejected as Sensitive");
+        assert!(
+            matches!(err, ConfineError::Sensitive(_)),
+            "expected Sensitive, got {err:?}"
+        );
+
+        // But a file one level below home (not in a sensitive subdir) is fine.
+        assert!(confine_path(&home_file, &union, &reg).is_ok());
+    }
 }
