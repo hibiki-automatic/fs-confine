@@ -16,10 +16,16 @@
 //! - [`confine`] — the SOLE confinement funnel: [`confine::confine_path`] (the
 //!   canonical gate), [`confine::confine_read`] (TOCTOU-free held-fd read),
 //!   [`confine::confine_save`] (dirfd-relative symlink-safe atomic write), and
-//!   [`confine::confine_link`] (the `/outside` classifier). The one production
-//!   `unsafe` (libc `openat`/`renameat`/`fstat`) is contained here and
-//!   documented at each call site.
+//!   [`confine::confine_link`] (the `/outside` classifier). Portable policy
+//!   only; mechanism is delegated to `backend`.
+//! - `backend` (crate-private) — the OS-specific mechanism layer behind the
+//!   [`backend::ConfineBackend`] trait. The production implementation
+//!   ([`backend::UnixBackend`]) contains the one production `unsafe`
+//!   (`openat`/`renameat`/`fstat`), documented at each call site. A future
+//!   macOS/Windows backend implements this trait and slots in without touching
+//!   the policy layer in `confine`.
 //!
+pub(crate) mod backend;
 pub mod confine;
 mod gate;
 pub mod roots;

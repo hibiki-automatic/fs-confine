@@ -7,6 +7,27 @@
 //! each *adding* TOCTOU surface (audit/02-security.md HIGH-2, HIGH-3, MED-4).
 //! Track-3 unifies all of it here.
 //!
+//! ## Architecture (Phase A seam)
+//!
+//! The funnel is split into two concerns:
+//!
+//! - **Portable policy** (this module): roots registry, denylist, root-union
+//!   containment, `/outside` classification, lexical/canonical gating. These
+//!   are OS-agnostic — they reason only about path strings and the `Roots`
+//!   registry, with no syscalls beyond [`std::path::Path::canonicalize`].
+//!
+//! - **Unix mechanism** ([`crate::backend`]): the syscall-level operations
+//!   (`openat`/`O_NOFOLLOW`/`dirfd`/`renameat`/`fstat`, held-fd TOCTOU-free
+//!   read, symlink-safe save, `O_EXCL` create) that give the funnel its security
+//!   properties. They are abstracted behind the internal [`crate::backend::ConfineBackend`]
+//!   trait with a single production implementor, [`crate::backend::UnixBackend`].
+//!
+//! The public functions ([`confine_path`], [`confine_read`], [`confine_save`],
+//! [`confine_link`]) are **API-stable** — their signatures, return types, and
+//! error variants are unchanged. Callers in `md-preview` and `md-hub` see no
+//! difference. A future macOS/Windows backend only needs to implement
+//! [`crate::backend::ConfineBackend`]; the policy layer here does not change.
+//!
 //! ## The invariants this module enforces *by construction*
 //!
 //! 1. **One funnel, no softer path.** Every caller-supplied path is resolved
@@ -15,23 +36,26 @@
 //!
 //! 2. **TOCTOU-free reads (audit HIGH-2 / HIGH-3).** [`confine_read`] does NOT
 //!    "confine, then stat, then read" across three separate path syscalls.
-//!    Instead it confines the path, then **`open()`s the file exactly once with
-//!    `O_NOFOLLOW`**, and **`fstat`s THAT SAME descriptor** for the size cap and
-//!    permission mode. The returned [`ConfinedFile`] hands the caller the held
-//!    `File` plus the `Metadata` read from that fd — so the route layer (W3)
-//!    reads from the held fd and applies the permission floor to the *fstat'd*
-//!    metadata. There is no second `stat`, no re-`open`, and the final component
-//!    can never be a followed symlink.
+//!    Instead it confines the path, then **opens the file exactly once with
+//!    `O_NOFOLLOW`** (via [`crate::backend::ConfineBackend::open_nofollow`]) and
+//!    **`fstat`s THAT SAME descriptor** (via
+//!    [`crate::backend::ConfineBackend::stat_fd`]) for the size cap and permission
+//!    mode. The returned [`ConfinedFile`] hands the caller the held `File` plus
+//!    the `Metadata` read from that fd — so the route layer reads from the held
+//!    fd and applies the permission floor to the *fstat'd* metadata. There is no
+//!    second `stat`, no re-`open`, and the final component can never be a
+//!    followed symlink.
 //!
 //! 3. **Symlink-safe saves (audit HIGH-2, follow-up F1).** [`confine_save`]
 //!    never writes through a possibly-symlinked path with `fs::write`, and never
-//!    re-resolves the parent by path after confining it. It holds the confined
-//!    parent as a **dirfd** opened with `O_DIRECTORY | O_NOFOLLOW`, then creates
-//!    the temp via `openat(dirfd, …, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` and
-//!    commits via `renameat(dirfd, temp, dirfd, target)`. Every step is relative
-//!    to the held dirfd, so neither the final component NOR an intermediate
-//!    parent component swapped to a symlink *after* the dirfd is held can
-//!    redirect the write outside the confined directory.
+//!    re-resolves the parent by path after confining it.
+//!    [`crate::backend::ConfineBackend::atomic_save`] holds the confined parent as
+//!    a **dirfd** opened with `O_DIRECTORY | O_NOFOLLOW`, then creates the temp
+//!    via `openat(dirfd, …, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` and commits via
+//!    `renameat(dirfd, temp, dirfd, target)`. Every step is relative to the held
+//!    dirfd, so neither the final component NOR an intermediate parent component
+//!    swapped to a symlink *after* the dirfd is held can redirect the write
+//!    outside the confined directory.
 //!
 //! 4. **Denylist always applies (audit MED-4).** Sensitive / denylisted paths
 //!    are rejected even on the empty-registry fallback. `roots::is_sensitive`
@@ -48,12 +72,15 @@
 //!
 //! No `unwrap` / `expect` / `panic` in production code paths.
 
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
+use crate::backend::{ConfineBackend, UnixBackend};
 use crate::roots::Root;
+
+// The production backend used by all public entry points. This is the only
+// place `UnixBackend` is named in the policy layer; a future platform backend
+// would swap in here (or be injected in tests).
+const BACKEND: UnixBackend = UnixBackend;
 
 /// Default maximum size, in bytes, that [`confine_read`] will accept for a file.
 ///
@@ -158,6 +185,10 @@ pub enum LinkResolution {
     Outside,
 }
 
+// ---------------------------------------------------------------------------
+// Portable policy helpers
+// ---------------------------------------------------------------------------
+
 /// Strict-descent containment check: is `candidate` `root` itself, or a strict
 /// descendant of it?
 ///
@@ -182,6 +213,10 @@ fn owned_by_any(canonical: &Path, roots_union: &[&Root]) -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Public API — policy (portable) + mechanism (via ConfineBackend)
+// ---------------------------------------------------------------------------
+
 /// Canonicalize an existing `requested` absolute path and confirm it is both
 /// contained within the active roots and not on the sensitive denylist.
 ///
@@ -199,6 +234,8 @@ fn owned_by_any(canonical: &Path, roots_union: &[&Root]) -> bool {
 /// On success returns the canonical, in-root path. The file must exist (it is
 /// canonicalized); for a not-yet-existing save target use [`confine_save`],
 /// which confines the parent directory instead.
+///
+/// This function is purely portable: no syscalls beyond [`Path::canonicalize`].
 pub fn confine_path(
     requested: &Path,
     roots_union: &[&Root],
@@ -228,13 +265,13 @@ pub fn confine_path(
 
 /// The TOCTOU-free read path (audit HIGH-2 / HIGH-3).
 ///
-/// Confines `requested` via [`confine_path`], then **opens the canonical path
-/// exactly once with `O_NOFOLLOW`** and **`fstat`s that same descriptor** for
-/// the size cap and the permission mode. The returned [`ConfinedFile`] lets the
-/// caller read from the held fd and apply the permission floor to the fstat'd
-/// metadata — there is no second `stat` and no re-`open`, so a symlink swapped
-/// in after confinement cannot redirect the read, and the final component can
-/// never itself be a followed symlink.
+/// Confines `requested` via [`confine_path`] (policy), then uses the Unix backend
+/// to **open the canonical path exactly once with `O_NOFOLLOW`** and **`fstat`
+/// that same descriptor** for the size cap and the permission mode. The returned
+/// [`ConfinedFile`] lets the caller read from the held fd and apply the permission
+/// floor to the fstat'd metadata — there is no second `stat` and no re-`open`, so
+/// a symlink swapped in after confinement cannot redirect the read, and the final
+/// component can never itself be a followed symlink.
 ///
 /// The size cap is enforced from the **fstat'd length** (not a prior path
 /// `stat`). Pass [`DEFAULT_MAX_FILE_SIZE`] for the standard cap.
@@ -247,24 +284,35 @@ pub fn confine_read(
     registry: &crate::roots::Roots,
     max_file_size: u64,
 ) -> Result<ConfinedFile, ConfineError> {
+    confine_read_with(requested, roots_union, registry, max_file_size, &BACKEND)
+}
+
+/// Internal version of [`confine_read`] that accepts an explicit backend.
+/// Used by the production path (with [`UnixBackend`]) and injectable in tests.
+pub(crate) fn confine_read_with(
+    requested: &Path,
+    roots_union: &[&Root],
+    registry: &crate::roots::Roots,
+    max_file_size: u64,
+    backend: &dyn ConfineBackend,
+) -> Result<ConfinedFile, ConfineError> {
+    // Policy: canonicalize + denylist + containment.
     let canonical = confine_path(requested, roots_union, registry)?;
 
-    // Open ONCE with O_NOFOLLOW. If the (canonical) final component is a
-    // symlink — e.g. swapped in after canonicalize — `open` fails with ELOOP
-    // rather than following it.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&canonical)
+    // Mechanism: open ONCE with O_NOFOLLOW. If the (canonical) final component
+    // is a symlink — e.g. swapped in after canonicalize — the backend's open
+    // fails with ELOOP rather than following it.
+    let file = backend
+        .open_nofollow(&canonical)
         .map_err(ConfineError::Io)?;
 
-    // fstat the SAME fd. No second path stat: the metadata describes exactly
-    // the bytes we will serve.
-    let metadata = file.metadata().map_err(ConfineError::Io)?;
+    // Mechanism: fstat the SAME fd. No second path stat: the metadata describes
+    // exactly the bytes we will serve.
+    let metadata = backend.stat_fd(&file).map_err(ConfineError::Io)?;
 
-    // Refuse non-regular files (a directory, fifo, device, …): only a real file
-    // can be served as a document, and this blocks reading from a non-symlink
-    // special that slipped through.
+    // Policy: refuse non-regular files (a directory, fifo, device, …): only a
+    // real file can be served as a document, and this blocks reading from a
+    // non-symlink special that slipped through.
     if !metadata.is_file() {
         return Err(ConfineError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -272,7 +320,7 @@ pub fn confine_read(
         )));
     }
 
-    // Size cap from the held fd's length.
+    // Policy: size cap from the held fd's length.
     let size = metadata.len();
     if size > max_file_size {
         return Err(ConfineError::TooLarge {
@@ -293,9 +341,9 @@ pub fn confine_read(
 ///
 /// The target file need not exist yet, so we cannot canonicalize it directly.
 /// Instead the **parent directory** is canonicalized and confined (it must be
-/// in-root and not sensitive). We then **hold that confined parent as a dirfd**
-/// opened with `O_DIRECTORY | O_NOFOLLOW`, and perform *every* subsequent
-/// filesystem operation relative to that dirfd:
+/// in-root and not sensitive). The Unix backend then holds that confined parent
+/// as a **dirfd** and performs *every* subsequent filesystem operation relative
+/// to that dirfd:
 ///
 /// - the temp file is created with
 ///   `openat(dirfd, tempname, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600)` —
@@ -316,6 +364,17 @@ pub fn confine_save(
     registry: &crate::roots::Roots,
     bytes: &[u8],
 ) -> Result<(), ConfineError> {
+    confine_save_with(requested, roots_union, registry, bytes, &BACKEND)
+}
+
+/// Internal version of [`confine_save`] that accepts an explicit backend.
+pub(crate) fn confine_save_with(
+    requested: &Path,
+    roots_union: &[&Root],
+    registry: &crate::roots::Roots,
+    bytes: &[u8],
+    backend: &dyn ConfineBackend,
+) -> Result<(), ConfineError> {
     if !requested.is_absolute() {
         return Err(ConfineError::NotAbsolute(requested.to_path_buf()));
     }
@@ -328,123 +387,19 @@ pub fn confine_save(
         .file_name()
         .ok_or_else(|| ConfineError::Escapes(requested.to_path_buf()))?;
 
-    // Confine the parent directory (it must exist). This canonicalizes it,
-    // applies the denylist, and confirms containment.
+    // Policy: confine the parent directory (it must exist). This canonicalizes
+    // it, applies the denylist, and confirms containment.
     let canonical_parent = confine_path(parent, roots_union, registry)?;
     let canonical_target = canonical_parent.join(file_name);
-    // Denylist the resolved target too (e.g. a save to `~/.ssh/x`).
+    // Policy: denylist the resolved target too (e.g. a save to `~/.ssh/x`).
     if registry.is_sensitive(&canonical_target) {
         return Err(ConfineError::Sensitive(canonical_target));
     }
 
-    // Hold the confined parent as a dirfd. `O_DIRECTORY` makes the open fail if
-    // it is not a directory; `O_NOFOLLOW` makes it fail if the final component
-    // of the confined parent path is itself a symlink. From here on every
-    // operation is relative to THIS fd — an intermediate parent swapped to a
-    // symlink after this point cannot be re-resolved (no second by-path open).
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(&canonical_parent)
-        .map_err(ConfineError::Io)?;
-    let dirfd = dir.as_raw_fd();
-
-    // The C-string names passed to the `*at` syscalls. A NUL byte in a path is
-    // impossible from a real filesystem path, but guard it rather than panic.
-    let temp_name = temp_sibling_name(file_name);
-    let temp_cstr = path_to_cstring(&temp_name).ok_or_else(|| {
-        ConfineError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "temp file name contains an interior NUL byte",
-        ))
-    })?;
-    let target_cstr = path_to_cstring(file_name).ok_or_else(|| {
-        ConfineError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "save target name contains an interior NUL byte",
-        ))
-    })?;
-
-    // Create the temp via openat, relative to the held dirfd.
-    // SAFETY: `dirfd` is borrowed from the live, owned `dir` File for the whole
-    // call, so it is a valid descriptor; `temp_cstr` is a NUL-terminated C
-    // string we own that outlives the call; the flags and mode are plain
-    // integers passed by value. `openat` writes nothing through our pointers —
-    // it only reads the path — and we check the returned fd before using it.
-    let temp_raw = unsafe {
-        libc::openat(
-            dirfd,
-            temp_cstr.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
-    };
-    if temp_raw < 0 {
-        return Err(ConfineError::Io(std::io::Error::last_os_error()));
-    }
-    // Take ownership so the fd is closed on every path (incl. early returns).
-    // SAFETY: `temp_raw` is a fresh, valid, owned fd just returned by `openat`
-    // (we checked it is non-negative); nothing else owns it.
-    let temp_file = unsafe { std::fs::File::from_raw_fd(temp_raw) };
-
-    // Write + fsync + commit, cleaning the temp entry up on any failure. The
-    // commit is renameat relative to the SAME dirfd on both sides.
-    let commit = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        // Re-borrow the owned File for buffered writes; this does not duplicate
-        // or close the fd.
-        let mut w = &temp_file;
-        w.write_all(bytes)?;
-        w.sync_all()?;
-        // SAFETY: both dirfds are the same live, owned `dir` descriptor (valid
-        // for the call); `temp_cstr`/`target_cstr` are NUL-terminated C strings
-        // we own that outlive the call. `renameat` only reads through the
-        // pointers. We check the rc below.
-        let rc = unsafe { libc::renameat(dirfd, temp_cstr.as_ptr(), dirfd, target_cstr.as_ptr()) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = commit {
-        // Best-effort cleanup of the temp entry via unlinkat on the held dirfd
-        // (so cleanup, too, cannot be redirected); ignore its own error.
-        // SAFETY: `dirfd` is the live, owned `dir` descriptor; `temp_cstr` is an
-        // owned NUL-terminated C string outliving the call; `unlinkat` only
-        // reads the path. The result is intentionally ignored (best-effort).
-        unsafe {
-            libc::unlinkat(dirfd, temp_cstr.as_ptr(), 0);
-        }
-        return Err(ConfineError::Io(e));
-    }
-
-    // `temp_file` and `dir` drop here, closing both fds.
-    Ok(())
-}
-
-/// Convert a path component (single file name, no separators) into a
-/// NUL-terminated [`std::ffi::CString`] for the `*at` syscalls. Returns `None`
-/// if the bytes contain an interior NUL (impossible for a real path component,
-/// but handled rather than panicking).
-fn path_to_cstring(name: &std::ffi::OsStr) -> Option<std::ffi::CString> {
-    std::ffi::CString::new(name.as_bytes()).ok()
-}
-
-/// Build a sibling temp-file name for an atomic save: `.<name>.<pid>.<n>.tmp`.
-///
-/// Hidden (leading dot) and process+counter qualified so concurrent saves in
-/// the same directory don't collide. `O_EXCL` is the real guard; this just keeps
-/// collisions rare.
-fn temp_sibling_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut name = std::ffi::OsString::from(".");
-    name.push(file_name);
-    name.push(format!(".{}.{}.tmp", std::process::id(), n));
-    name
+    // Mechanism: dirfd-relative atomic save via the backend.
+    backend
+        .atomic_save(&canonical_parent, file_name, bytes)
+        .map_err(ConfineError::Io)
 }
 
 /// Classify a document-link target for rewriting.
@@ -454,6 +409,9 @@ fn temp_sibling_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
 /// instead of a dead link. A non-absolute path, a missing target, a sensitive
 /// path, or any escape all map to `Outside`; only a path that canonicalizes
 /// in-root and off the denylist yields [`LinkResolution::InRoot`].
+///
+/// This function is purely portable: it delegates entirely to [`confine_path`],
+/// which uses no mechanism calls.
 pub fn confine_link(
     requested: &Path,
     roots_union: &[&Root],
@@ -712,6 +670,7 @@ mod tests {
 
         // Directly O_NOFOLLOW-opening the symlink path fails — proves the
         // funnel's open never follows a final-component symlink.
+        use std::os::unix::fs::OpenOptionsExt as _;
         let direct = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -1232,5 +1191,118 @@ mod tests {
 
         // But a file one level below home (not in a sensitive subdir) is fine.
         assert!(confine_path(&home_file, &union, &reg).is_ok());
+    }
+
+    // --- backend seam tests -----------------------------------------------
+    // These tests verify the seam itself: that confine_read_with /
+    // confine_save_with can accept an alternative backend, which is what makes
+    // a future macOS/Windows backend slottable without changing the policy layer.
+
+    /// A stub backend that records open calls and returns a real file for reads.
+    struct RecordingBackend {
+        opened: std::cell::Cell<u32>,
+        statted: std::cell::Cell<u32>,
+        /// The real path to open for `open_nofollow` (so the test gets a valid fd).
+        real_path: PathBuf,
+    }
+
+    impl RecordingBackend {
+        fn new(real_path: PathBuf) -> Self {
+            Self {
+                opened: std::cell::Cell::new(0),
+                statted: std::cell::Cell::new(0),
+                real_path,
+            }
+        }
+    }
+
+    impl ConfineBackend for RecordingBackend {
+        fn open_nofollow(&self, _canonical: &Path) -> std::io::Result<std::fs::File> {
+            self.opened.set(self.opened.get() + 1);
+            std::fs::File::open(&self.real_path)
+        }
+
+        fn stat_fd(&self, file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+            self.statted.set(self.statted.get() + 1);
+            file.metadata()
+        }
+
+        fn atomic_save(
+            &self,
+            _canonical_dir: &Path,
+            _file_name: &std::ffi::OsStr,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            std::fs::write(&self.real_path, bytes)
+        }
+    }
+
+    #[test]
+    fn seam_confine_read_with_calls_backend_open_and_stat() {
+        let dir = TempDir::new("seam-read");
+        let file = dir.file("doc.md");
+        std::fs::write(&file, "seam test").unwrap();
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        let backend = RecordingBackend::new(file.clone());
+        let confined = confine_read_with(&file, &union, &reg, DEFAULT_MAX_FILE_SIZE, &backend)
+            .expect("seam read confines");
+
+        assert_eq!(backend.opened.get(), 1, "open_nofollow called exactly once");
+        assert_eq!(backend.statted.get(), 1, "stat_fd called exactly once");
+        assert_eq!(confined.canonical, file);
+    }
+
+    #[test]
+    fn seam_confine_save_with_calls_backend_atomic_save() {
+        let dir = TempDir::new("seam-save");
+        let file = dir.file("doc.md");
+        std::fs::write(&file, "initial").unwrap();
+
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        let backend = RecordingBackend::new(file.clone());
+        confine_save_with(&file, &union, &reg, b"seam saved", &backend)
+            .expect("seam save confines");
+
+        // RecordingBackend's atomic_save writes directly to real_path.
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "seam saved",
+            "backend received the bytes"
+        );
+    }
+
+    #[test]
+    fn seam_policy_rejects_before_calling_backend() {
+        // When the policy layer rejects (e.g. escaping path), the backend must
+        // NOT be called — the open_nofollow counter stays at zero.
+        let dir = TempDir::new("seam-reject");
+        let outside = TempDir::new("seam-reject-out");
+        let secret = outside.file("secret.md");
+        std::fs::write(&secret, "x").unwrap();
+
+        // The union covers only `dir`, NOT `outside`.
+        let root = dir_root(&dir.path);
+        let union = vec![&root];
+        let reg = registry_home(Path::new("/nonexistent-home"));
+
+        let backend = RecordingBackend::new(secret.clone());
+        let err = confine_read_with(&secret, &union, &reg, DEFAULT_MAX_FILE_SIZE, &backend)
+            .expect_err("escaping path rejected before backend is called");
+        assert!(
+            matches!(err, ConfineError::Escapes(_)),
+            "expected Escapes, got {err:?}"
+        );
+        assert_eq!(
+            backend.opened.get(),
+            0,
+            "backend must not be called when policy rejects"
+        );
     }
 }

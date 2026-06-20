@@ -32,12 +32,22 @@ let bytes = confine_read(&roots, "/home/user/docs/notes.md")?;
 confine_save(&roots, "/home/user/docs/notes.md", &bytes)?;
 ```
 
-The sole production `unsafe` (libc `openat`/`renameat`/`fstat`) is contained in `confine.rs` and documented at each call site.
+The sole production `unsafe` (libc `openat`/`renameat`/`fstat`) is contained in `backend.rs` (`UnixBackend`) and documented at each call site.
+
+## Policy / mechanism seam (Phase A)
+
+The funnel is split into two concerns so a future macOS/Windows (or `cap-std`) backend can slot in without touching policy:
+
+- **Portable policy** (`confine.rs`): roots registry, sensitive-path denylist, root-union containment, `/outside` classification, lexical/canonical gating. No OS-specific syscalls — only `std::path::Path::canonicalize`.
+- **Unix mechanism** (`backend.rs`, crate-private): the `ConfineBackend` trait abstracts three syscall clusters — `open_nofollow` (`O_NOFOLLOW` open), `stat_fd` (`fstat` on the held fd), and `atomic_save` (dirfd-relative `openat`/`renameat`/`unlinkat`). The production `UnixBackend` struct implements this trait and contains all production `unsafe`.
+
+The public API is unchanged. A future platform backend implements `ConfineBackend` and wires into the policy layer without altering `confine.rs`.
 
 ## Modules
 
 - `roots` — multi-root registry: project-root detection, sensitive-path denylist, sliding-TTL registry, plain-text persistence
-- `confine` — the sole confinement funnel: `confine_path`, `confine_read`, `confine_save`, `confine_link`
+- `confine` — the sole confinement funnel (portable policy): `confine_path`, `confine_read`, `confine_save`, `confine_link`
+- `backend` (crate-private) — OS-specific mechanism: `ConfineBackend` trait + `UnixBackend` (contains all `unsafe`)
 
 ## Part of the [mycelium](https://github.com/hibiki-automatic) ecosystem
 
